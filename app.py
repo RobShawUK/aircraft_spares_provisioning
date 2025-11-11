@@ -1,18 +1,15 @@
-import io
+import json
 import pandas as pd
 import streamlit as st
 
-from spares_provisioning import provision_from_parameters, provision_row
+from spares_provisioning import (
+    provision_from_parameters,
+    provision_row,
+    provision_network,
+)
 
 st.set_page_config(page_title="Spares Provisioning (Poisson)", page_icon="✈️", layout="centered")
 st.title("✈️ Spares Provisioning (Poisson)")
-
-with st.expander("How it works", expanded=False):
-    st.markdown("""
-- Stock level **s** is chosen so **P{Poisson(λ) ≤ s} ≥ Confidence**.
-- λ = (fleet × qty/aircraft) × (TAT hours / MTBF).
-- TAT hours = TAT days × (annual hours / days/year) — default 360 (Excel-like).
-""")
 
 tab1, tab2 = st.tabs(["Single scenario", "Batch (CSV/XLSX)"])
 
@@ -29,8 +26,18 @@ with tab1:
 
     days_per_year = st.selectbox("Days/year for utilization", [360.0, 365.0], index=0)
 
+    st.subheader("Network mode")
+    mode = st.radio("Choose inventory strategy", ["Pooled (single pool)", "Distributed (per station)"], index=0)
+    stations = st.number_input("Number of stations", min_value=1, value=1, step=1)
+    weights_str = st.text_input(
+        "Station weights (optional, comma-separated; e.g., 1,2,1 for uneven load)",
+        value="",
+        help="Leave blank for identical stations. If provided, must match #stations."
+    )
+
     if st.button("Calculate", type="primary"):
-        res = provision_from_parameters(
+        # Base result (Excel-like mirror)
+        base = provision_from_parameters(
             aircraft_in_fleet=fleet,
             avg_annual_hours=annual_hours,
             qty_per_aircraft=qty_per_ac,
@@ -39,32 +46,49 @@ with tab1:
             confidence_level=conf,
             days_per_year=float(days_per_year),
         )
-        st.metric("Recommended spares", res["recommended_spares"])
+
+        st.write("### Excel-like baseline")
+        st.metric("Recommended spares (pooled baseline)", base["recommended_spares"])
         st.write(pd.DataFrame([{
-            "Turn time (hours)": res["turn_time_hours"],
-            "Effective population": res["effective_population"],
-            "Lambda (demand during turn)": res["lambda"],
+            "Turn time (hours)": base["turn_time_hours"],
+            "Effective population": base["effective_population"],
+            "Lambda (demand during turn)": base["lambda"],
             "Confidence Level": conf,
         }]).round(6))
 
-with tab2:
-    st.markdown("Upload CSV/XLSX. Min columns (case-insensitive): "
-                "`mtbf_hours`, `availability_target`, and either `turn_time_hours` **or** both `turn_time_days` + `avg_annual_hours`. "
-                "Optional: `population`, `demand_multiplier`.")
-    up = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"])
-    fmt = st.selectbox("Output format", ["CSV", "Excel (XLSX)"])
-    if up:
-        df = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
-        cols = {c.lower(): c for c in df.columns}
-        if "turn_time_hours" not in cols and {"turn_time_days","avg_annual_hours"}.issubset(cols):
-            df["turn_time_hours"] = df[cols["turn_time_days"]] * (df[cols["avg_annual_hours"]] / 360.0)
-        out = df.apply(lambda r: pd.Series(provision_row(r.to_dict())), axis=1)
-        st.dataframe(out)
-        if fmt == "CSV":
-            buf = io.StringIO(); out.to_csv(buf, index=False)
-            st.download_button("Download CSV", buf.getvalue().encode("utf-8"), file_name="provisioned.csv")
-        else:
-            xbuf = io.BytesIO()
-            with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
-                out.to_excel(w, index=False, sheet_name="Provisioned")
-            st.download_button("Download XLSX", xbuf.getvalue(), file_name="provisioned.xlsx")
+        # Network calculation
+        selected_mode = "pooled" if mode.startswith("Pooled") else "distributed"
+        weights = None
+        if weights_str.strip():
+            weights = [float(x.strip()) for x in weights_str.split(",") if x.strip()]
+
+        net = provision_network(
+            aircraft_in_fleet=fleet,
+            avg_annual_hours=annual_hours,
+            qty_per_aircraft=qty_per_ac,
+            turn_time_days=tat_days,
+            mtbf_hours=mtbf,
+            confidence_level=conf,
+            stations=int(stations),
+            days_per_year=float(days_per_year),
+            mode=selected_mode,
+            station_weights=weights,
+        )
+
+        st.write("### Network result")
+        st.write(pd.DataFrame([{
+            "Stations": stations,
+            "Lambda total": net["lambda_total"],
+            "Pooled S_total": net["pooled"]["recommended_spares"],
+            "Distributed S_total": net["distributed"]["recommended_spares_total"],
+            "Pooling savings (extra units if distributed)": net["pooling_savings"],
+        }]).round(6))
+
+        if selected_mode == "distributed":
+            per = pd.DataFrame({
+                "Station": list(range(1, int(stations) + 1)),
+                "Lambda_i": net["distributed"]["lambda_per_station"],
+                "S_i": net["distributed"]["recommended_spares_per_station"],
+            })
+            st.write("Per-station breakdown")
+            st.dataframe(per)
